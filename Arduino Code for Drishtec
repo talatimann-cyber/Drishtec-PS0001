@@ -1,0 +1,209 @@
+/*
+ * ============================================================
+ *  DRISHTEC - Wearable Obstacle Alert Cap (1.5 m version)
+ *  Seva First Innovation Challenge
+ * ============================================================
+ *  Two ultrasonic sensors point forward on the cap brim, tilted
+ *  slightly to the LEFT and to the RIGHT (about 10 to 15 degrees
+ *  each). Each sensor has its own buzzer. Anything between 5 cm
+ *  and 150 cm triggers a warning on that side.
+ *
+ *    Zone     Distance       Sound
+ *    AHEAD    100 - 150 cm   slow, low beeps
+ *    CLOSE     50 - 100 cm   fast, medium beeps
+ *    DANGER     5 -  50 cm   very fast, high beeps
+ *
+ *  The RIGHT buzzer sounds 500 Hz higher than the LEFT one.
+ *  A status LED stays ON while the way is clear and BLINKS when an
+ *  object is detected (faster blinking = closer object).
+ *  The Serial Monitor also says which side the obstacle is on.
+ *
+ *  Board  : Arduino Uno
+ *  Sensors: 2 x HC-SR04      Buzzers: 2 x passive buzzer
+ * ============================================================
+ */
+
+/* ---------- Pin connections (change here if your wiring differs) ---------- */
+#define LEFT   0
+#define RIGHT  1
+
+int trigPin[2]   = {9, 11};     /* LEFT, RIGHT */
+int echoPin[2]   = {10, 12};
+int buzzerPin[2] = {8, 7};
+
+/* Status LED: long leg -> 220 ohm resistor -> pin 6, short leg -> GND.
+   Set LED_PIN to 13 to use the Uno's built-in LED instead. */
+#define LED_PIN  6
+
+/* ---------- Detection range ---------- */
+#define MIN_CM            5
+#define MAX_CM            400
+#define CLOSE_CM          200   /* below this: CLOSE zone  */
+#define DANGER_CM         75    /* below this: DANGER zone */
+#define CENTER_TOLERANCE  20    /* L and R within 20 cm = straight ahead */
+
+/* ---------- Timing ---------- */
+#define PING_GAP_MS      60      /* quiet time between pings of different sensors */
+#define PING_TIMEOUT_US  10000   /* stop waiting for an echo after about 170 cm   */
+
+/* ---------- Sounds: one entry per zone ---------- */
+#define ZONE_CLEAR   0
+#define ZONE_AHEAD   1
+#define ZONE_CLOSE   2
+#define ZONE_DANGER  3
+
+int zonePitchHz[4]        = {0, 1000, 1500, 2000};
+int zoneBeepMs[4]         = {0, 80, 60, 70};
+int zonePeriodMs[4]       = {0, 480, 160, 100};
+int sidePitchShiftHz[2]   = {0, 500};
+int ledBlinkMs[4]         = {0, 400, 200, 100};   /* AHEAD, CLOSE, DANGER */
+
+/* ---------- Program state ---------- */
+float         distanceCm[2] = {-1, -1};
+unsigned long nextBeepAt[2] = {0, 0};
+unsigned long toneEndsAt    = 0;      /* the Uno plays one tone at a time */
+unsigned long lastPingAt    = 0;
+unsigned long nextBlinkAt   = 0;
+int           ledState      = HIGH;
+int           sensorTurn    = LEFT;
+
+
+/* Measure distance in cm with one sensor. Returns -1 if no echo. */
+float readDistanceCm(int side) {
+  long echoMicros;
+
+  digitalWrite(trigPin[side], LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin[side], HIGH);      /* 10 microsecond trigger pulse */
+  delayMicroseconds(10);
+  digitalWrite(trigPin[side], LOW);
+
+  echoMicros = pulseIn(echoPin[side], HIGH, PING_TIMEOUT_US);
+  if (echoMicros == 0) {
+    return -1;
+  }
+
+  /* sound travels 0.0343 cm per microsecond, there and back */
+  return echoMicros * 0.0343 / 2;
+}
+
+
+/* Decide which zone a distance falls into. */
+int zoneFor(float cm) {
+  if (cm < MIN_CM || cm > MAX_CM) return ZONE_CLEAR;
+  if (cm < DANGER_CM)             return ZONE_DANGER;
+  if (cm < CLOSE_CM)              return ZONE_CLOSE;
+  return ZONE_AHEAD;
+}
+
+
+/* Print one line, e.g.  L: 82.1 cm | R: -- | Obstacle: LEFT */
+void report(void) {
+  int leftHit  = (zoneFor(distanceCm[LEFT])  != ZONE_CLEAR);
+  int rightHit = (zoneFor(distanceCm[RIGHT]) != ZONE_CLEAR);
+  float diff;
+
+  Serial.print("L: ");
+  if (leftHit)  { Serial.print(distanceCm[LEFT], 1);  Serial.print(" cm"); }
+  else          { Serial.print("--");                                      }
+  Serial.print(" | R: ");
+  if (rightHit) { Serial.print(distanceCm[RIGHT], 1); Serial.print(" cm"); }
+  else          { Serial.print("--");                                      }
+  Serial.print(" | Obstacle: ");
+
+  if (leftHit && rightHit) {
+    diff = distanceCm[LEFT] - distanceCm[RIGHT];
+    if (diff < 0) diff = -diff;
+    if (diff <= CENTER_TOLERANCE)                       Serial.println("CENTER");
+    else if (distanceCm[LEFT] < distanceCm[RIGHT])      Serial.println("LEFT");
+    else                                                Serial.println("RIGHT");
+  } else if (leftHit) {
+    Serial.println("LEFT");
+  } else if (rightHit) {
+    Serial.println("RIGHT");
+  } else {
+    Serial.println("CLEAR");
+  }
+}
+
+
+/* Play a short beep for this side if its next beep is due. */
+void beepIfDue(int side, int zone, unsigned long now) {
+  if (zone == ZONE_CLEAR) return;
+  if ((long)(now - nextBeepAt[side]) < 0) return;   /* not due yet        */
+  if ((long)(now - toneEndsAt) < 0) return;         /* another tone is on */
+
+  tone(buzzerPin[side], zonePitchHz[zone] + sidePitchShiftHz[side],
+       zoneBeepMs[zone]);
+  toneEndsAt        = now + zoneBeepMs[zone] + 5;
+  nextBeepAt[side]  = now + zonePeriodMs[zone];
+}
+
+
+/* LED steady ON when clear, blinking when something is detected. */
+void updateLed(unsigned long now) {
+  int zone = zoneFor(distanceCm[LEFT]);
+  int zoneRight = zoneFor(distanceCm[RIGHT]);
+
+  if (zoneRight > zone) zone = zoneRight;     /* use the nearer object */
+
+  if (zone == ZONE_CLEAR) {
+    ledState = HIGH;
+    digitalWrite(LED_PIN, HIGH);
+    return;
+  }
+  if ((long)(now - nextBlinkAt) >= 0) {
+    ledState = (ledState == HIGH) ? LOW : HIGH;
+    digitalWrite(LED_PIN, ledState);
+    nextBlinkAt = now + ledBlinkMs[zone];
+  }
+}
+
+
+void setup(void) {
+  int side;
+
+  Serial.begin(9600);
+  Serial.println("=== DRISHTEC obstacle alert cap (1.5 m) ===");
+
+  for (side = LEFT; side <= RIGHT; side++) {
+    pinMode(trigPin[side], OUTPUT);
+    pinMode(echoPin[side], INPUT);
+    pinMode(buzzerPin[side], OUTPUT);
+  }
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);    /* LED on from power-up */
+
+  /* start-up self-test: LEFT beeps, then RIGHT */
+  for (side = LEFT; side <= RIGHT; side++) {
+    tone(buzzerPin[side], 1500 + sidePitchShiftHz[side], 150);
+    delay(300);
+  }
+}
+
+
+void loop(void) {
+  unsigned long now;
+  int side;
+
+  /* 1. Take turns pinging, one sensor every PING_GAP_MS */
+  now = millis();
+  if (now - lastPingAt >= PING_GAP_MS) {
+    lastPingAt = now;
+    distanceCm[sensorTurn] = readDistanceCm(sensorTurn);
+    if (sensorTurn == RIGHT) {
+      report();                 /* one tidy line after both have measured */
+    }
+    sensorTurn = (sensorTurn == LEFT) ? RIGHT : LEFT;
+  }
+
+  /* 2. Beep for each side that has something in range */
+  now = millis();
+  for (side = LEFT; side <= RIGHT; side++) {
+    beepIfDue(side, zoneFor(distanceCm[side]), now);
+  }
+
+  /* 3. Status LED */
+  updateLed(now);
+}
